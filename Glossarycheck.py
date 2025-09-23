@@ -14,7 +14,7 @@ def extract_text_from_docx(docx_file):
     return "\n".join(text)
 
 def highlight_docx_terms(docx_file, terms):
-    """Highlight all terms in a docx file (target terms)."""
+    """Highlight all target terms in a Word file."""
     doc = docx.Document(docx_file)
     for para in doc.paragraphs:
         for term in terms:
@@ -28,42 +28,45 @@ def highlight_docx_terms(docx_file, terms):
     return doc
 
 def highlight_missing_source_terms(source_file, glossary_df, target_text):
-    """Highlight source terms whose target terms are missing in the target file."""
+    """
+    Highlight only those source terms whose corresponding target terms are missing
+    in the target Word file.
+    """
     doc = docx.Document(source_file)
     for para in doc.paragraphs:
         para_text = para.text
-        for _, row in glossary_df.iterrows():
-            source_term = str(row["Source Term"])
-            target_term = str(row["Target Term"])
-            
-            # Only highlight if target term is missing
-            target_present = bool(re.search(re.escape(target_term), target_text, flags=re.IGNORECASE))
-            if not target_present:
-                # Use regex to find all matches of source_term in paragraph
-                pattern = re.compile(re.escape(source_term), re.IGNORECASE)
-                matches = list(pattern.finditer(para_text))
-                if matches:
-                    # Clear old runs and rebuild paragraph
-                    new_runs = []
-                    last_idx = 0
-                    for match in matches:
-                        # Text before match
-                        if match.start() > last_idx:
-                            new_run = para.add_run(para_text[last_idx:match.start()])
-                            new_runs.append(new_run)
-                        # Highlighted match
-                        highlight_run = para.add_run(para_text[match.start():match.end()])
-                        highlight_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-                        highlight_run.bold = True
-                        new_runs.append(highlight_run)
-                        last_idx = match.end()
-                    # Text after last match
-                    if last_idx < len(para_text):
-                        new_run = para.add_run(para_text[last_idx:])
-                        new_runs.append(new_run)
-                    # Remove old runs
-                    for run in para.runs:
-                        para._element.remove(run._element)
+        if not para_text.strip():
+            continue
+        new_runs = []
+        idx = 0
+        while idx < len(para_text):
+            highlight_run = None
+            for _, row in glossary_df.iterrows():
+                source_term = str(row["Source Term"])
+                target_term = str(row["Target Term"])
+                # Only highlight if target term is missing
+                target_present = bool(re.search(re.escape(target_term), target_text, flags=re.IGNORECASE))
+                if not target_present:
+                    pattern = re.compile(re.escape(source_term), re.IGNORECASE)
+                    match = pattern.match(para_text, idx)
+                    if match:
+                        highlight_run = match
+                        break
+            if highlight_run:
+                run = para.add_run(para_text[highlight_run.start():highlight_run.end()])
+                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                run.bold = True
+                idx = highlight_run.end()
+            else:
+                run = para.add_run(para_text[idx])
+                idx += 1
+            new_runs.append(run)
+        # Remove old runs
+        for run in para.runs[:]:
+            para._element.remove(run._element)
+        # Add rebuilt runs
+        for run in new_runs:
+            para._element.append(run._element)
     return doc
 
 # ---------- Streamlit UI ----------
@@ -156,7 +159,7 @@ if glossary_file and source_file and target_file:
         )
 
         # Highlighted Source File (only missing target terms)
-        st.subheader("Download Highlighted Source File (Terms Not in Target)")
+        st.subheader("Download Highlighted Source File (Terms Missing in Target)")
         highlighted_source_doc = highlight_missing_source_terms(source_file, glossary_df, target_text)
         highlighted_source_output = BytesIO()
         highlighted_source_doc.save(highlighted_source_output)
