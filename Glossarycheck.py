@@ -13,10 +13,11 @@ def extract_text_from_docx(docx_file):
         text.append(para.text)
     return "\n".join(text)
 
-def highlight_docx(docx_file, glossary_terms):
+def highlight_docx_terms(docx_file, terms):
+    """Highlight all terms in a docx file (target terms)."""
     doc = docx.Document(docx_file)
     for para in doc.paragraphs:
-        for term in glossary_terms:
+        for term in terms:
             if not isinstance(term, str) or not term.strip():
                 continue
             pattern = re.compile(re.escape(term), re.IGNORECASE)
@@ -24,6 +25,24 @@ def highlight_docx(docx_file, glossary_terms):
                 if pattern.search(run.text):
                     run.font.highlight_color = WD_COLOR_INDEX.YELLOW
                     run.bold = True
+    return doc
+
+def highlight_missing_source_terms(source_file, glossary_df, target_text):
+    """Highlight only source terms whose target terms are missing in target file."""
+    doc = docx.Document(source_file)
+    for para in doc.paragraphs:
+        for _, row in glossary_df.iterrows():
+            source_term = str(row["Source Term"])
+            target_term = str(row["Target Term"])
+            
+            # Highlight source term only if target term is missing
+            target_present = bool(re.search(re.escape(target_term), target_text, flags=re.IGNORECASE))
+            if not target_present:
+                pattern = re.compile(re.escape(source_term), re.IGNORECASE)
+                for run in para.runs:
+                    if pattern.search(run.text):
+                        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                        run.bold = True
     return doc
 
 # ---------- Streamlit UI ----------
@@ -103,14 +122,26 @@ if glossary_file and source_file and target_file:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # Highlighted Word file
-        st.subheader("Download Highlighted Word File")
-        highlighted_doc = highlight_docx(target_file, glossary_df["Target Term"].tolist())
-        highlighted_output = BytesIO()
-        highlighted_doc.save(highlighted_output)
+        # Highlighted Target File (all target terms)
+        st.subheader("Download Highlighted Target File")
+        highlighted_target_doc = highlight_docx_terms(target_file, glossary_df["Target Term"].tolist())
+        highlighted_target_output = BytesIO()
+        highlighted_target_doc.save(highlighted_target_output)
         st.download_button(
-            label="Download Highlighted Word File",
-            data=highlighted_output.getvalue(),
-            file_name="highlighted_translation.docx",
+            label="Download Highlighted Target File",
+            data=highlighted_target_output.getvalue(),
+            file_name="highlighted_target.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+
+        # Highlighted Source File (only missing target terms)
+        st.subheader("Download Highlighted Source File (Terms Not in Target)")
+        highlighted_source_doc = highlight_missing_source_terms(source_file, glossary_df, target_text)
+        highlighted_source_output = BytesIO()
+        highlighted_source_doc.save(highlighted_source_output)
+        st.download_button(
+            label="Download Highlighted Source File",
+            data=highlighted_source_output.getvalue(),
+            file_name="highlighted_source_terms.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
