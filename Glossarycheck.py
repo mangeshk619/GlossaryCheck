@@ -28,21 +28,42 @@ def highlight_docx_terms(docx_file, terms):
     return doc
 
 def highlight_missing_source_terms(source_file, glossary_df, target_text):
-    """Highlight only source terms whose target terms are missing in target file."""
+    """Highlight source terms whose target terms are missing in the target file."""
     doc = docx.Document(source_file)
     for para in doc.paragraphs:
+        para_text = para.text
         for _, row in glossary_df.iterrows():
             source_term = str(row["Source Term"])
             target_term = str(row["Target Term"])
             
-            # Highlight source term only if target term is missing
+            # Only highlight if target term is missing
             target_present = bool(re.search(re.escape(target_term), target_text, flags=re.IGNORECASE))
             if not target_present:
+                # Use regex to find all matches of source_term in paragraph
                 pattern = re.compile(re.escape(source_term), re.IGNORECASE)
-                for run in para.runs:
-                    if pattern.search(run.text):
-                        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-                        run.bold = True
+                matches = list(pattern.finditer(para_text))
+                if matches:
+                    # Clear old runs and rebuild paragraph
+                    new_runs = []
+                    last_idx = 0
+                    for match in matches:
+                        # Text before match
+                        if match.start() > last_idx:
+                            new_run = para.add_run(para_text[last_idx:match.start()])
+                            new_runs.append(new_run)
+                        # Highlighted match
+                        highlight_run = para.add_run(para_text[match.start():match.end()])
+                        highlight_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                        highlight_run.bold = True
+                        new_runs.append(highlight_run)
+                        last_idx = match.end()
+                    # Text after last match
+                    if last_idx < len(para_text):
+                        new_run = para.add_run(para_text[last_idx:])
+                        new_runs.append(new_run)
+                    # Remove old runs
+                    for run in para.runs:
+                        para._element.remove(run._element)
     return doc
 
 # ---------- Streamlit UI ----------
