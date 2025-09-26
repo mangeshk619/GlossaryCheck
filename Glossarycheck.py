@@ -13,31 +13,23 @@ except Exception:
     OPENCC_AVAILABLE = False
     cc_s2t = None
 
-st.set_page_config(page_title="TW MoJ Terminology Checker", layout="wide")
+st.set_page_config(page_title="TW MoJ Terminology Checker (EN → ZH-TW)", layout="wide")
 st.title("🇹🇼 Ministry of Justice (Taiwan) — Separate Source/Target Terminology & Script Checker")
 
-with st.expander("How it works"):
+with st.expander("How it works / What changed"):
     st.markdown("""
-**Inputs supported**
-- **Source (English)**: `.txt`, `.csv`, `.tsv`, `.xlsx`, `.xls`, `.docx`
-- **Target (Traditional Chinese)**: `.txt`, `.csv`, `.tsv`, `.xlsx`, `.xls`, `.docx`
-- **Glossary**: `.csv` or `.xlsx` with columns:
-  - `en_term` (English source term/pattern)
-  - `zh_tw_term` (required ZH-TW term)
-  - *(optional)* `notes`
-- *(Optional)* Mainland→Taiwan overrides CSV/XLSX with columns: `mainland,taiwan`
-
-**Alignment**
-- If your files are tabular and have the relevant text in specific columns, set the column names below.
-- If files are plain text, alignment is by **line number** (line 1 ↔ line 1, etc.).
-
-**What is checked**
-1) Which glossary **EN terms** occur in the Source, and whether the **required ZH-TW terms** appear in the aligned Target segment (adhered / not adhered).  
-2) **Simplified Chinese** characters in Target (OpenCC heuristic).  
-3) **Mainland** terms in Target and suggested **Taiwan-preferred** equivalents (seed list + optional overrides).
+**NEW (to fix false negatives/positives):**
+- **Alignment preview** (first 20 rows) to verify Source↔Target pairing
+- **Normalization** for ZH: trims whitespace, normalizes full-width/half-width punctuation, collapses spaces
+- **Multiple ZH variants** per glossary row via `zh_tw_term_variants` **or** pipe-separated values in `zh_tw_term`  
+  (e.g., `檢察官|檢察官（書記官）|檢察官（含代理）`)
+- **Optional regex columns**: `en_term_regex` and/or `zh_tw_term_regex` (Y/Yes/True) for pattern-based matching
+- **Whole-word** matching toggle for English (default **ON**)
+- **Debug sheet** with normalized strings, match reasons
+- Better **Simplified char** sheet (lists differing characters with context)
     """)
 
-# --- Mainland→Taiwan seed list (extend with your own CSV/XLSX) ---
+# Mainland → Taiwan seed list (extend with your own CSV/XLSX)
 MAINLAND_TO_TW = {
     "软件": "軟體",
     "硬件": "硬體",
@@ -60,14 +52,48 @@ MAINLAND_TO_TW = {
     "登出": "登出",
 }
 
+# ----------------- Normalization helpers -----------------
+_FW_TO_HW = str.maketrans({
+    "，": ",", "。": ".", "；": ";", "：": ":", "！": "!", "？": "?",
+    "（": "(", "）": ")", "【": "[", "】": "]", "「": '"', "」": '"',
+    "『": '"', "』": '"', "、": ",", "　": " ", "－": "-", "～": "~",
+    "《": "<", "》": ">"
+})
+def normalize_zh(s: str) -> str:
+    """Normalize Traditional Chinese string for robust contains checks."""
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.translate(_FW_TO_HW)       # full-width → half-width punctuation
+    s = re.sub(r"\s+", " ", s)       # collapse whitespace
+    return s.strip()
+
+def normalize_en(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def split_variants(val: str) -> List[str]:
+    """Support variants via dedicated column OR pipe-separated."""
+    if val is None:
+        return []
+    s = str(val).strip()
+    if not s:
+        return []
+    return [x.strip() for x in s.split("|") if x.strip()]
+
 # ----------------- File loaders -----------------
 def load_plain_text(file) -> str:
     name = file.name.lower()
     if name.endswith(".txt"):
         return file.read().decode("utf-8", errors="ignore")
-    elif name.endswith((".csv", ".tsv")):
-        sep = "," if name.endswith(".csv") else "\t"
-        df = pd.read_csv(file, sep=sep, dtype=str).fillna("")
+    elif name.endswith(".csv"):
+        df = pd.read_csv(file, dtype=str).fillna("")
+        return "\n".join([" ".join(map(str, row)) for row in df.values])
+    elif name.endswith(".tsv"):
+        df = pd.read_csv(file, sep="\t", dtype=str).fillna("")
         return "\n".join([" ".join(map(str, row)) for row in df.values])
     elif name.endswith((".xlsx", ".xls")):
         df = pd.read_excel(file, dtype=str).fillna("")
@@ -93,25 +119,19 @@ def load_table(file) -> Optional[pd.DataFrame]:
         return pd.read_csv(file, sep="\t", dtype=str).fillna("")
     if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(file, dtype=str).fillna("")
-    # For DOCX/TXT, not table-like; return None
-    return None
+    return None  # txt/docx → not table
 
 def best_effort(file, prefer_table_col: Optional[str]) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    """
-    Try to read as table if a column name is provided; otherwise fall back to text.
-    Returns (df, text). Only one is non-None.
-    """
+    """Return (df, text). Only one will be non-None."""
     if prefer_table_col:
         df = load_table(file)
         if df is not None:
             return df, None
         file.seek(0)
-    # fallback to plain text
     text = load_plain_text(file)
     return None, text
 
 def segments_from_text(text: str) -> List[str]:
-    # Line-wise segmentation
     return [ln.strip() for ln in text.splitlines()]
 
 def build_aligned_segments(
@@ -132,7 +152,6 @@ def build_aligned_segments(
     else:
         tgt = []
 
-    # pad to equal length
     n = max(len(src), len(tgt))
     if len(src) < n:
         src += [""] * (n - len(src))
@@ -140,33 +159,89 @@ def build_aligned_segments(
         tgt += [""] * (n - len(tgt))
     return src, tgt
 
-# ----------------- Glossary / detection helpers -----------------
-def glossary_check(src: List[str], tgt: List[str], glossary: pd.DataFrame,
-                   case_sensitive: bool, whole_word: bool) -> pd.DataFrame:
-    recs = []
+# ----------------- Matching helpers -----------------
+def contains_en(hay: str, needle: str, case_sensitive: bool, whole_word: bool, is_regex: bool) -> bool:
+    if not needle:
+        return False
+    if is_regex:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            pat = re.compile(needle, flags)
+        except re.error:
+            return False
+        return bool(pat.search(hay))
+    # literal
     flags = 0 if case_sensitive else re.IGNORECASE
-    for i, (s, t) in enumerate(zip(src, tgt), start=1):
+    pat = re.escape(needle)
+    if whole_word:
+        pat = r"\b" + pat + r"\b"
+    return bool(re.search(pat, hay, flags))
+
+def contains_zh(hay_norm: str, zh_expected: str, zh_regex: bool) -> Tuple[bool, str]:
+    """Return (match, reason). `hay_norm` already normalized."""
+    if not zh_expected:
+        return False, "no_zh_expected"
+    if zh_regex:
+        try:
+            pat = re.compile(zh_expected)
+        except re.error as e:
+            return False, f"bad_zh_regex: {e}"
+        return (bool(pat.search(hay_norm)), "regex") if pat.search(hay_norm) else (False, "regex_no_match")
+    # literal; allow pipe-separated variants
+    variants = split_variants(zh_expected)
+    if not variants:
+        variants = [zh_expected]
+    for v in variants:
+        if normalize_zh(v) and normalize_zh(v) in hay_norm:
+            return True, f"literal_contains:{v}"
+    return False, "literal_no_variant_match"
+
+# ----------------- Glossary / detection -----------------
+def glossary_check(src: List[str], tgt: List[str], glossary: pd.DataFrame,
+                   case_sensitive: bool, whole_word: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    rows = []
+    debug = []
+    for i, (s_raw, t_raw) in enumerate(zip(src, tgt), start=1):
+        s = normalize_en(s_raw)
+        t = normalize_zh(t_raw)
         for _, row in glossary.iterrows():
-            en = str(row["en_term"])
-            zh_req = str(row["zh_tw_term"])
+            en = str(row["en_term"]).strip()
+            zh_req = str(row["zh_tw_term"]).strip()
             notes = str(row.get("notes", ""))
 
-            pat = re.escape(en)
-            if whole_word:
-                pat = r"\b" + pat + r"\b"
+            en_regex = str(row.get("en_term_regex", "")).strip().lower() in ("y","yes","true","1")
+            zh_regex = str(row.get("zh_tw_term_regex", "")).strip().lower() in ("y","yes","true","1")
 
-            if re.search(pat, s, flags):
-                adhered = zh_req in t
-                recs.append({
-                    "segment": i,
-                    "source_excerpt": s[:200],
-                    "target_excerpt": t[:200],
-                    "en_term": en,
-                    "zh_tw_expected": zh_req,
-                    "adhered": adhered,
-                    "notes": notes
-                })
-    return pd.DataFrame(recs)
+            en_found = contains_en(s, en, case_sensitive, whole_word, en_regex)
+            if not en_found:
+                continue
+
+            zh_match, reason = contains_zh(t, zh_req, zh_regex)
+
+            rows.append({
+                "segment": i,
+                "source_excerpt": s_raw[:200],
+                "target_excerpt": t_raw[:200],
+                "en_term": en,
+                "zh_tw_expected": zh_req,
+                "adhered": zh_match,
+                "reason": reason,
+                "notes": notes
+            })
+            debug.append({
+                "segment": i,
+                "src_norm": s,
+                "tgt_norm": t,
+                "en_term": en,
+                "en_regex": en_regex,
+                "whole_word": whole_word,
+                "case_sensitive": case_sensitive,
+                "zh_expected": zh_req,
+                "zh_regex": zh_regex,
+                "adhered": zh_match,
+                "reason": reason
+            })
+    return pd.DataFrame(rows), pd.DataFrame(debug)
 
 def simplified_check(tgt: List[str]) -> pd.DataFrame:
     if not OPENCC_AVAILABLE:
@@ -175,18 +250,20 @@ def simplified_check(tgt: List[str]) -> pd.DataFrame:
     for i, t in enumerate(tgt, start=1):
         conv = cc_s2t.convert(t)
         if conv != t:
-            hits.append({"segment": i, "text_excerpt": t[:200]})
+            # collect differing CJK chars only
+            differing = sorted({ch for ch in t if re.match(r"[\u4e00-\u9fff]", ch) and cc_s2t.convert(ch) != ch})
+            if differing:
+                hits.append({"segment": i, "differing_chars": "".join(differing), "target_excerpt": t[:200]})
     return pd.DataFrame(hits)
 
 def mainland_check(tgt: List[str], map_ml2tw: dict) -> pd.DataFrame:
     hits = []
-    for i, t in enumerate(tgt, start=1):
-        if not t.strip():
-            continue
+    for i, t_raw in enumerate(tgt, start=1):
+        t = normalize_zh(t_raw)
         for ml, tw in map_ml2tw.items():
-            if ml in t:
-                hits.append({"segment": i, "mainland_term": ml, "suggested_tw": tw, "context": t[:200]})
-    return pd.DataFrame(hits)
+            if ml in t_raw:  # keep original context check
+                hits.append({"segment": i, "mainland_term": ml, "suggested_tw": tw, "context": t_raw[:200]})
+    return pd.DataFrame(hits).drop_duplicates()
 
 # ----------------- Sidebar: uploads & options -----------------
 st.sidebar.header("Upload files (separate Source & Target)")
@@ -203,7 +280,6 @@ st.sidebar.subheader("Matching options")
 whole_word = st.sidebar.checkbox("Match EN terms as whole words", True)
 case_sensitive = st.sidebar.checkbox("Case-sensitive EN match", False)
 
-# Load overrides
 if override_file is not None:
     try:
         if override_file.name.lower().endswith(".csv"):
@@ -217,17 +293,24 @@ if override_file is not None:
     except Exception as e:
         st.sidebar.warning(f"Could not read overrides: {e}")
 
-# ----------------- Run checks -----------------
+# ----------------- Run -----------------
 if src_file and tgt_file and gls_file:
-    # Read source/target with table preference if a column is given
     src_df, src_text = best_effort(src_file, prefer_table_col=src_col)
     tgt_df, tgt_text = best_effort(tgt_file, prefer_table_col=tgt_col)
 
-    # Build aligned segments
     src_segments, tgt_segments = build_aligned_segments(
         src_df, src_text, src_col, tgt_df, tgt_text, tgt_col
     )
     st.info(f"Aligned {len(src_segments)} segment(s) (row/line-wise).")
+
+    # Alignment preview
+    st.subheader("Quick alignment preview (first 20)")
+    prev_df = pd.DataFrame({
+        "segment": list(range(1, min(20, len(src_segments)) + 1)),
+        "source": src_segments[:20],
+        "target": tgt_segments[:20]
+    })
+    st.dataframe(prev_df, use_container_width=True)
 
     # Read glossary
     try:
@@ -248,15 +331,33 @@ if src_file and tgt_file and gls_file:
 
     en_col = pick("en_term", "english", "source", "en")
     zh_col = pick("zh_tw_term", "zh_tw", "zh-hant", "traditional_chinese", "target", "tw")
+    zh_var_col = pick("zh_tw_term_variants", "zh_variants", "variants")
+    en_regex_col = pick("en_term_regex",)
+    zh_regex_col = pick("zh_tw_term_regex",)
 
     if not en_col or not zh_col:
-        st.error("Glossary must have columns `en_term` and `zh_tw_term` (headers can be flexibly named).")
+        st.error("Glossary must include `en_term` and `zh_tw_term` (headers can be flexibly named).")
         st.stop()
 
-    glossary = glossary.rename(columns={en_col: "en_term", zh_col: "zh_tw_term"})
+    glossary = glossary.rename(columns={
+        en_col: "en_term",
+        zh_col: "zh_tw_term",
+        **({zh_var_col: "zh_tw_term_variants"} if zh_var_col else {}),
+        **({en_regex_col: "en_term_regex"} if en_regex_col else {}),
+        **({zh_regex_col: "zh_tw_term_regex"} if zh_regex_col else {}),
+    })
+
+    # Merge variants column (if present) into zh_tw_term as pipes so both paths work
+    if "zh_tw_term_variants" in glossary.columns:
+        merged = []
+        for _, r in glossary.iterrows():
+            base = str(r.get("zh_tw_term","")).strip()
+            vars_ = split_variants(r.get("zh_tw_term_variants",""))
+            merged.append("|".join([x for x in ([base] + vars_) if x]))
+        glossary["zh_tw_term"] = merged
 
     # Checks
-    adh = glossary_check(src_segments, tgt_segments, glossary, case_sensitive, whole_word)
+    adh, dbg = glossary_check(src_segments, tgt_segments, glossary, case_sensitive, whole_word)
     simp = simplified_check(tgt_segments)
     ml = mainland_check(tgt_segments, MAINLAND_TO_TW)
 
@@ -270,10 +371,7 @@ if src_file and tgt_file and gls_file:
     k4.metric("Simplified char flags", len(simp))
 
     st.subheader("Glossary adherence (segment-level)")
-    if adh.empty:
-        st.info("No glossary terms found in the Source.")
-    else:
-        st.dataframe(adh, use_container_width=True)
+    st.dataframe(adh if not adh.empty else pd.DataFrame([{"info":"No glossary matches"}]), use_container_width=True)
 
     st.subheader("Simplified Chinese characters flagged")
     if OPENCC_AVAILABLE:
@@ -284,18 +382,16 @@ if src_file and tgt_file and gls_file:
     st.subheader("Mainland terms vs Taiwan-preferred equivalents")
     st.dataframe(ml if not ml.empty else pd.DataFrame([{"info":"None detected in current list"}]), use_container_width=True)
 
-    # Export: Excel with multiple sheets
+    # Export: Excel with multiple sheets + debug
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
         (adh if not adh.empty else pd.DataFrame([{"info":"No glossary matches"}])).to_excel(writer, index=False, sheet_name="glossary_adherence")
         (simp if not simp.empty else pd.DataFrame([{"info":"No simplified chars flagged"}])).to_excel(writer, index=False, sheet_name="simplified_chars")
         (ml if not ml.empty else pd.DataFrame([{"info":"No mainland terms flagged"}])).to_excel(writer, index=False, sheet_name="mainland_vs_tw")
-        pd.DataFrame({"segment": list(range(1, len(src_segments)+1)),
-                      "source": src_segments,
-                      "target": tgt_segments}).to_excel(writer, index=False, sheet_name="alignment_dump")
-    st.download_button("Download report.xlsx", data=out.getvalue(),
+        pd.DataFrame({"segment": list(range(1, len(src_segments)+1)), "source": src_segments, "target": tgt_segments}).to_excel(writer, index=False, sheet_name="alignment_dump")
+        (dbg if not dbg.empty else pd.DataFrame([{"info":"no debug"}])).to_excel(writer, index=False, sheet_name="debug_internal")
+    st.download_button("Download tw_moj_check_report.xlsx", data=out.getvalue(),
                        file_name="tw_moj_check_report.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
 else:
     st.info("Upload **Source (EN)**, **Target (ZH-TW)**, and **Glossary** to run checks.")
