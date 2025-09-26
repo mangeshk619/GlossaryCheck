@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import re, io
+import re, io, os
 from collections import Counter, defaultdict
 from typing import Optional, List, Tuple
 
@@ -13,21 +13,23 @@ except Exception:
     OPENCC = False
     cc_s2t = None
 
-st.set_page_config(page_title="TW MoJ — Corpus Glossary + Simplified Audit", layout="wide")
-st.title("🇹🇼 TW MoJ — Corpus-level Glossary Adherence & Simplified Audit (EN ↔ ZH-TW)")
+st.set_page_config(page_title="TW MoJ — Glossary Adherence & Simplified Audit", layout="wide")
+st.title("🇹🇼 TW MoJ — Corpus-level Glossary Adherence (EN ↔ ZH-TW) + Simplified Audit")
 
 with st.expander("How it works"):
     st.markdown("""
-- **No alignment required** (works on whole corpora).
+- Separate corpora; **no alignment** needed.
 - **Direction**:
-  - **EN → ZH-TW**: enforce Chinese terms in Target; optional filter by English terms in Source.
-  - **ZH-TW → EN**: enforce English terms in Target; optional filter by Chinese terms in Source.
-- **Glossary**: you will **explicitly pick** which column is English and which is Traditional Chinese.
-- Optional columns: `notes`, `en_term_regex`, `zh_tw_term_regex`. For multiple accepted forms, put `A|B|C` in the expected term cell or provide a regex + set `*_regex=Y`.
-- Outputs: corpus adherence, **Simplified character audit** (on the Chinese corpus), **Mainland→Taiwan** scan, and an Excel export.
+  - **EN → ZH-TW**: enforce Chinese terms in Target; optional filter by English Source.
+  - **ZH-TW → EN**: enforce English terms in Target; optional filter by Chinese Source.
+- **Glossary**: upload CSV/XLSX or auto-load `glossary_template.csv` from the repo. You explicitly map which column is **English** and which is **Chinese**.
+- **Report schema** (first sheet in Excel & on-screen):  
+  `zh_tw_term, en_expected, adhered_in_target, match_count, matched_variant_examples`
+- Optional: `en_term_regex`, `zh_tw_term_regex`, `notes`, multi-variant with `A|B|C`.
+- Extras: Simplified-character audit (Chinese corpus) + Mainland→Taiwan term scan.
     """)
 
-# ---- Mainland -> Taiwan seed map (you can override via CSV) ----
+# ---- Mainland -> Taiwan seed map (override via CSV if needed) ----
 MAINLAND_TO_TW = {
     "软件": "軟體","硬件": "硬體","互联网": "網際網路","网络": "網路","手机": "手機",
     "邮箱": "電子郵件","邮件": "郵件","图标": "圖示","应用程序": "應用程式","服务器": "伺服器",
@@ -49,7 +51,6 @@ def normalize_zh(s: str) -> str:
 
 def normalize_en(s: str) -> str:
     if s is None: return ""
-    # keep original case; we match case-insensitively later for EN
     return re.sub(r"\s+", " ", str(s)).strip()
 
 def _read_docx(file) -> str:
@@ -65,10 +66,6 @@ def _read_docx(file) -> str:
     return "\n".join([p for p in parts if p is not None])
 
 def read_any(file) -> Tuple[str, List[str]]:
-    """
-    Read any supported file into: (full_text, segments_list)
-    TXT/DOCX -> line segments; CSV/TSV/XLSX -> row segments.
-    """
     name = file.name.lower()
     if name.endswith(".txt"):
         raw = file.read().decode("utf-8", errors="ignore")
@@ -104,15 +101,25 @@ def load_table(file) -> Optional[pd.DataFrame]:
         return pd.read_excel(file, dtype=str).fillna("")
     return None
 
-# ---------- Explicit glossary mapping ----------
+# ---------- Glossary helpers ----------
 def read_glossary_raw(gls_file) -> pd.DataFrame:
     if gls_file.name.lower().endswith(".csv"):
         return pd.read_csv(gls_file, dtype=str).fillna("")
     else:
         return pd.read_excel(gls_file, dtype=str).fillna("")
 
-def load_glossary_with_user_mapping(gls_file, user_en_col: str, user_zh_col: str) -> pd.DataFrame:
-    df = read_glossary_raw(gls_file)
+def read_repo_glossary_template() -> Optional[pd.DataFrame]:
+    path = os.path.join(os.getcwd(), "glossary_template.csv")
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path, dtype=str).fillna("")
+            df._source_path = path  # just for display if you want
+            return df
+        except Exception:
+            return None
+    return None
+
+def load_glossary_with_user_mapping_df(df: pd.DataFrame, user_en_col: str, user_zh_col: str) -> pd.DataFrame:
     cols = list(df.columns)
     if user_en_col not in cols or user_zh_col not in cols:
         raise ValueError("Please choose valid columns for English and Chinese terms.")
@@ -217,15 +224,14 @@ def simplified_char_audit(raw_text: str, segments: List[str], context_window: in
 # ---------------- Sidebar ----------------
 st.sidebar.header("Uploads")
 src_file = st.sidebar.file_uploader("Optional Source corpus", type=["txt","csv","tsv","xlsx","xls","docx"])
-tgt_file = st.sidebar.file_uploader("Target corpus (required)", type=["txt","csv","tsv","xlsx","xls","docx"])
-gls_file = st.sidebar.file_uploader("Glossary (CSV/XLSX, required)", type=["csv","xlsx","xls"])
-override_file = st.sidebar.file_uploader("Optional Mainland→Taiwan overrides (CSV/XLSX)", type=["csv","xlsx","xls"])
+tgt_file = st.sidebar.file_uploader("Target corpus (required for run)", type=["txt","csv","tsv","xlsx","xls","docx"])
+gls_file = st.sidebar.file_uploader("Glossary (CSV/XLSX)", type=["csv","xlsx","xls"])
 
 st.sidebar.header("Direction & Mode")
 direction = st.sidebar.radio("Direction", ["EN → ZH-TW","ZH-TW → EN"], index=0)
 mode = st.sidebar.radio("Check mode", ["Filtered by Source (recommended)","Target-only"], index=0)
 
-st.sidebar.header("Matching")
+st.sidebar.header("Matching (EN side)")
 whole_word = st.sidebar.checkbox("Whole-word when matching EN", True)  # used for EN filtering and EN target matching
 case_sensitive = st.sidebar.checkbox("EN filter is case-sensitive", False)
 
@@ -235,6 +241,7 @@ ignore_input = st.sidebar.text_input("Ignore these Chinese characters (comma-sep
 ignore_chars = set([c.strip() for c in ignore_input.split(",") if c.strip()])
 
 # ---- Load overrides for Mainland→Taiwan map ----
+override_file = st.sidebar.file_uploader("Optional Mainland→Taiwan overrides (CSV/XLSX)", type=["csv","xlsx","xls"])
 if override_file is not None:
     try:
         df_o = load_table(override_file)
@@ -245,12 +252,24 @@ if override_file is not None:
     except Exception as e:
         st.sidebar.warning(f"Override load failed: {e}")
 
-# ---- Glossary column pickers ----
-en_col_choice = None
-zh_col_choice = None
+# ---- Glossary: upload or auto-load from repo ----
+st.sidebar.header("Glossary source")
+use_repo_template = st.sidebar.checkbox("Use glossary_template.csv from repo if no upload", value=True)
+
 gls_df_preview = None
+glossary_source = None
 if gls_file is not None:
     gls_df_preview = read_glossary_raw(gls_file)
+    glossary_source = "uploaded"
+elif use_repo_template:
+    repo_df = read_repo_glossary_template()
+    if repo_df is not None:
+        gls_df_preview = repo_df
+        glossary_source = "repo_template"
+
+# If we have any glossary df, let user map columns
+en_col_choice = zh_col_choice = None
+if gls_df_preview is not None:
     st.sidebar.subheader("Glossary column mapping")
     cols = list(gls_df_preview.columns)
 
@@ -261,14 +280,18 @@ if gls_file is not None:
                     return i
         return 0
 
-    en_default = guess_index(cols, ["en_term","english","en","target_en","expected_en","eng"])
-    zh_default = guess_index(cols, ["zh_tw_term","zh_tw","zh-hant","traditional_chinese","zh","chinese","source_zh"])
+    if glossary_source == "repo_template":
+        en_default = guess_index(cols, ["en_term","english","en"])
+        zh_default = guess_index(cols, ["zh_tw_term","zh_tw","zh-hant","traditional_chinese","zh"])
+    else:
+        en_default = guess_index(cols, ["en_term","english","en","target_en","expected_en","eng"])
+        zh_default = guess_index(cols, ["zh_tw_term","zh_tw","zh-hant","traditional_chinese","zh","chinese","source_zh"])
 
     en_col_choice = st.sidebar.selectbox("English term column", cols, index=en_default)
     zh_col_choice = st.sidebar.selectbox("Chinese term column (Traditional)", cols, index=zh_default)
 
 # ---------------- RUN ----------------
-if tgt_file and gls_file and en_col_choice and zh_col_choice:
+if tgt_file and (gls_df_preview is not None) and (en_col_choice and zh_col_choice):
     # Read corpora
     def read_any_public(file):
         if not file: return ("", [])
@@ -303,29 +326,29 @@ if tgt_file and gls_file and en_col_choice and zh_col_choice:
     if direction == "EN → ZH-TW":
         src_norm = normalize_en(src_raw) if src_raw else ""
         tgt_norm = normalize_zh(tgt_raw)
-        chinese_corpus_for_flags_raw = tgt_raw
-        chinese_segments_for_flags = tgt_segments
+        chinese_raw = tgt_raw
+        chinese_segments = tgt_segments
     else:  # ZH-TW → EN
         src_norm = normalize_zh(src_raw) if src_raw else ""
         tgt_norm = normalize_en(tgt_raw)
-        chinese_corpus_for_flags_raw = src_raw if src_raw else ""
-        chinese_segments_for_flags = src_segments if src_file else []
+        chinese_raw = src_raw if src_file else ""
+        chinese_segments = src_segments if src_file else []
 
     # Load glossary with explicit mapping
     try:
-        glossary = load_glossary_with_user_mapping(gls_file, en_col_choice, zh_col_choice)
+        glossary = load_glossary_with_user_mapping_df(gls_df_preview, en_col_choice, zh_col_choice)
     except Exception as e:
         st.error(str(e)); st.stop()
 
-    # Determine which columns act as "filter" vs "expected" (by direction)
+    # Choose which columns filter vs expected (by direction)
     if direction == "EN → ZH-TW":
-        filter_term_col, filter_rx_col = "en_term", "en_term_regex"        # EN filters (optional)
-        expected_term_col, expected_rx_col = "zh_tw_term", "zh_tw_term_regex"  # ZH expected in Target
-    else:  # ZH-TW → EN
-        filter_term_col, filter_rx_col = "zh_tw_term", "zh_tw_term_regex"  # ZH filters (optional)
-        expected_term_col, expected_rx_col = "en_term", "en_term_regex"    # EN expected in Target
+        filter_term_col, filter_rx_col = "en_term", "en_term_regex"          # EN filter (optional)
+        expected_term_col, expected_rx_col = "zh_tw_term", "zh_tw_term_regex"  # ZH expected in TARGET
+    else:
+        filter_term_col, filter_rx_col = "zh_tw_term", "zh_tw_term_regex"    # ZH filter (optional)
+        expected_term_col, expected_rx_col = "en_term", "en_term_regex"      # EN expected in TARGET
 
-    # Filter-by-Source mode (optional)
+    # Filter-by-Source (optional)
     if mode == "Filtered by Source (recommended)":
         if not src_file:
             st.warning("Filtered-by-Source selected, but no Source uploaded. All glossary rows will be enforced.")
@@ -336,9 +359,8 @@ if tgt_file and gls_file and en_col_choice and zh_col_choice:
             if not term:
                 keep.append(False); continue
             if not src_norm:
-                keep.append(True); continue  # no source provided -> keep all
+                keep.append(True); continue
             if direction == "EN → ZH-TW":
-                # EN filter on src_norm(EN)
                 flags = 0 if case_sensitive else re.IGNORECASE
                 if is_rx:
                     try: pat = re.compile(term, flags)
@@ -349,7 +371,6 @@ if tgt_file and gls_file and en_col_choice and zh_col_choice:
                     if whole_word: pat = r"\b"+pat+r"\b"
                     keep.append(bool(re.search(pat, src_norm, flags)))
             else:
-                # ZH filter on src_norm(ZH)
                 if is_rx:
                     try: pat = re.compile(term)
                     except re.error: keep.append(False); continue
@@ -361,39 +382,45 @@ if tgt_file and gls_file and en_col_choice and zh_col_choice:
     else:
         st.info(f"Target-only mode: enforcing all {len(glossary)} rows on Target corpus.")
 
-    # Enforce on Target (coverage)
+    # ========= Enforce on Target (build REQUIRED 5-column report) =========
     rows = []
     for _, r in glossary.iterrows():
+        zh_gloss = str(r.get("zh_tw_term", ""))   # always included in report
+        en_gloss = str(r.get("en_term", ""))      # always included in report
+
         expected = str(r.get(expected_term_col, ""))
         is_rx = str(r.get(expected_rx_col, "")).strip().lower() in ("y","yes","true","1")
-        note = str(r.get("notes",""))
 
-        match_count, matched_variants, contexts = 0, [], []
+        match_count, matched_variants = 0, []
 
         if is_rx:
-            # Regex: case-insensitive when EN is target; default for ZH target
-            flags = re.IGNORECASE if direction=="ZH-TW → EN" else 0
+            # Regex: case-insensitive if EN is target; default otherwise
+            flags = re.IGNORECASE if direction == "ZH-TW → EN" else 0
             try:
                 pat = re.compile(expected, flags)
-            except re.error as e:
+            except re.error:
+                # bad regex -> treated as not adhered
                 rows.append({
-                    "expected_in_target": expected, "adhered_in_target": False,
-                    "match_count": 0, "matched_variants": "", "sample_contexts": f"bad_regex: {e}", "notes": note
+                    "zh_tw_term": zh_gloss,
+                    "en_expected": en_gloss,
+                    "adhered_in_target": False,
+                    "match_count": 0,
+                    "matched_variant_examples": "",
                 })
                 continue
-            for m in pat.finditer(tgt_norm):
-                match_count += 1
-                if len(contexts) < 5:
-                    a, b = m.start(), m.end()
-                    contexts.append(tgt_norm[max(0,a-32):b+32].replace("\n"," "))
+            hits = list(pat.finditer(tgt_norm))
+            match_count = len(hits)
+            if match_count > 0:
+                matched_variants.append(expected)
         else:
+            # Literal; support variants A|B|C on the expected side
             variants = split_variants(expected) if expected else []
             if not variants:
                 variants = [expected]
 
             for v in variants:
                 if direction == "EN → ZH-TW":
-                    # ZH literal: normalize and contains
+                    # Chinese literal: normalize & contains
                     vv = normalize_zh(v)
                     if not vv: continue
                     start = 0
@@ -402,66 +429,67 @@ if tgt_file and gls_file and en_col_choice and zh_col_choice:
                         if pos == -1: break
                         match_count += 1
                         matched_variants.append(v)
-                        if len(contexts) < 5:
-                            contexts.append(tgt_norm[max(0,pos-32):pos+len(vv)+32].replace("\n"," "))
                         start = pos + len(vv)
                 else:
-                    # EN literal: case-insensitive + optional whole-word
-                    cnt, ctxs = en_literal_find_all(tgt_norm, v, whole_word=whole_word)
-                    match_count += cnt
-                    if cnt > 0:
+                    # English literal: case-insensitive + optional whole-word
+                    pat = re.escape(v.strip())
+                    if whole_word:
+                        pat = r"\b" + pat + r"\b"
+                    hits = list(re.finditer(pat, tgt_norm, flags=re.IGNORECASE))
+                    if hits:
+                        match_count += len(hits)
                         matched_variants.append(v)
-                        contexts += ctxs
 
         rows.append({
-            "expected_in_target": expected,
+            "zh_tw_term": zh_gloss,
+            "en_expected": en_gloss,
             "adhered_in_target": match_count > 0,
             "match_count": match_count,
-            "matched_variants": "|".join(sorted(set(matched_variants))) if matched_variants else "",
-            "sample_contexts": " … ".join(contexts),
-            "notes": note
+            "matched_variant_examples": "|".join(sorted(set(matched_variants))) if matched_variants else "",
         })
-    coverage = pd.DataFrame(rows)
 
-    # Simplified audit & Mainland terms (on whichever side is Chinese)
+    report_df = pd.DataFrame(rows, columns=[
+        "zh_tw_term", "en_expected", "adhered_in_target", "match_count", "matched_variant_examples"
+    ])
+
+    # ========= Simplified audit & Mainland terms on the Chinese corpus =========
     if direction == "EN → ZH-TW":
-        chinese_raw = tgt_raw
+        chinese_corpus = tgt_raw
         chinese_segments = tgt_segments
     else:
-        chinese_raw = src_raw if src_file else ""
+        chinese_corpus = src_raw if src_file else ""
         chinese_segments = src_segments if src_file else []
 
-    if chinese_raw:
+    if chinese_corpus:
         if OPENCC:
             simp_summary_df, simp_occ_df = simplified_char_audit(
-                chinese_raw, chinese_segments, context_window=context_window, ignore_chars=ignore_chars
+                chinese_corpus, chinese_segments, context_window=context_window, ignore_chars=ignore_chars
             )
         else:
             simp_summary_df, simp_occ_df = pd.DataFrame(), pd.DataFrame()
-        # Mainland terms
         ml_hits = []
         for ml, tw in MAINLAND_TO_TW.items():
-            if ml in chinese_raw:
+            if ml in chinese_corpus:
                 ml_hits.append({
                     "mainland_term": ml,
                     "suggested_tw": tw,
-                    "sample_contexts": " … ".join(sample_contexts(chinese_raw, ml))
+                    "sample_contexts": " … ".join(sample_contexts(chinese_corpus, ml))
                 })
         ml_df = pd.DataFrame(ml_hits) if ml_hits else pd.DataFrame([{"info":"No mainland terms (from current list) detected"}])
     else:
         simp_summary_df, simp_occ_df = pd.DataFrame(), pd.DataFrame()
         ml_df = pd.DataFrame([{"info":"No Chinese corpus to check"}])
 
-    # KPIs
-    c1, c2, c3, c4 = st.columns(4)
-    total = len(coverage); adhered = int(coverage["adhered_in_target"].sum()) if total else 0
-    c1.metric("Glossary rows enforced", total)
+    # ========= KPIs & tables =========
+    c1, c2, c3 = st.columns(3)
+    enforced = len(report_df)
+    adhered = int(report_df["adhered_in_target"].sum()) if enforced else 0
+    c1.metric("Glossary rows enforced", enforced)
     c2.metric("Adhered in Target", adhered)
-    c3.metric("Not adhered", total - adhered)
-    c4.metric("Unique Simplified chars", len(simp_summary_df) if not simp_summary_df.empty else 0)
+    c3.metric("Not adhered", enforced - adhered)
 
-    st.subheader("Corpus-level Glossary Adherence")
-    st.dataframe(coverage if not coverage.empty else pd.DataFrame([{"info":"No coverage data"}]), use_container_width=True)
+    st.subheader("Glossary adherence (required schema)")
+    st.dataframe(report_df, use_container_width=True)
 
     st.subheader("Simplified Character Audit")
     if not OPENCC:
@@ -477,7 +505,7 @@ if tgt_file and gls_file and en_col_choice and zh_col_choice:
     st.subheader("Mainland terms in Chinese corpus")
     st.dataframe(ml_df, use_container_width=True)
 
-    # Basic stats
+    # Basic stats (Target)
     def text_stats(s: str, segments: List[str]):
         cjk = re.findall(r'[\u4e00-\u9fff]', s)
         latin = re.findall(r'[A-Za-z]', s)
@@ -491,20 +519,22 @@ if tgt_file and gls_file and en_col_choice and zh_col_choice:
         }])
     stats_df = text_stats(tgt_raw, tgt_segments)
 
-    # Export to Excel
+    # ========= Export to Excel (first sheet = your 5-column report) =========
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as xw:
-        coverage.to_excel(xw, index=False, sheet_name="coverage")
+        report_df.to_excel(xw, index=False, sheet_name="coverage_minimal")
         (simp_summary_df if not simp_summary_df.empty else pd.DataFrame([{"info":"No simplified chars flagged"}])).to_excel(xw, index=False, sheet_name="simplified_summary")
         (simp_occ_df if not simp_occ_df.empty else pd.DataFrame([{"info":"No occurrences"}])).to_excel(xw, index=False, sheet_name="simplified_occurrences")
         ml_df.to_excel(xw, index=False, sheet_name="mainland_vs_tw")
         stats_df.to_excel(xw, index=False, sheet_name="text_stats")
         pd.DataFrame([{
-            "direction":direction,"mode":mode,"whole_word_EN":whole_word,
+            "direction": direction, "mode": mode, "whole_word_EN": whole_word,
+            "glossary_source": ("uploaded" if gls_file else (glossary_source or "unknown")),
             "en_col": en_col_choice, "zh_col": zh_col_choice
         }]).to_excel(xw, index=False, sheet_name="run_info")
+
     st.download_button("Download report.xlsx", out.getvalue(), "twmoj_corpus_report.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 else:
-    st.info("Upload **Target corpus** and **Glossary**, then choose the **English** and **Chinese** columns in the sidebar. (Source is optional for Filtered-by-Source.)")
+    st.info("Upload **Target corpus** and a **Glossary** (or auto-load `glossary_template.csv`), then choose the **English** and **Chinese** columns in the sidebar. (Source is optional for Filtered-by-Source.)")
