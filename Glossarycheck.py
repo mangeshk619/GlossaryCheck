@@ -23,8 +23,9 @@ with st.expander("How it works"):
   - **EN → ZH-TW**: enforce Chinese terms in Target; optional filter by English Source.
   - **ZH-TW → EN**: enforce English terms in Target; optional filter by Chinese Source.
 - **Glossary**: upload CSV/XLSX or auto-load `glossary_template.csv` from the repo. You explicitly map which column is **English** and which is **Chinese**.
-- **Report schema** (first sheet in Excel & on-screen):  
-  `zh_tw_term, en_expected, adhered_in_target, match_count, matched_variant_examples`
+- **Report schema**:
+  - EN → ZH-TW: `en_term, zh_tw_expected, adhered_in_target, match_count, matched_variant_examples`
+  - ZH-TW → EN: `zh_tw_term, en_expected, adhered_in_target, match_count, matched_variant_examples`
 - Optional: `en_term_regex`, `zh_tw_term_regex`, `notes`, multi-variant with `A|B|C`.
 - Extras: Simplified-character audit (Chinese corpus) + Mainland→Taiwan term scan.
     """)
@@ -113,7 +114,7 @@ def read_repo_glossary_template() -> Optional[pd.DataFrame]:
     if os.path.exists(path):
         try:
             df = pd.read_csv(path, dtype=str).fillna("")
-            df._source_path = path  # just for display if you want
+            df._source_path = path  # optional
             return df
         except Exception:
             return None
@@ -124,7 +125,7 @@ def load_glossary_with_user_mapping_df(df: pd.DataFrame, user_en_col: str, user_
     if user_en_col not in cols or user_zh_col not in cols:
         raise ValueError("Please choose valid columns for English and Chinese terms.")
     out = df.rename(columns={user_en_col: "en_term", user_zh_col: "zh_tw_term"})
-    # carry over optional columns if present
+    # carry optional columns if present
     for c in df.columns:
         cl = c.strip().lower()
         if cl == "en_term_regex" and "en_term_regex" not in out.columns:
@@ -382,11 +383,11 @@ if tgt_file and (gls_df_preview is not None) and (en_col_choice and zh_col_choic
     else:
         st.info(f"Target-only mode: enforcing all {len(glossary)} rows on Target corpus.")
 
-    # ========= Enforce on Target (build REQUIRED 5-column report) =========
+    # ========= Enforce on Target (collect rows; keep BOTH sides) =========
     rows = []
     for _, r in glossary.iterrows():
-        zh_gloss = str(r.get("zh_tw_term", ""))   # always included in report
-        en_gloss = str(r.get("en_term", ""))      # always included in report
+        zh_gloss = str(r.get("zh_tw_term", ""))   # always kept
+        en_gloss = str(r.get("en_term", ""))      # always kept
 
         expected = str(r.get(expected_term_col, ""))
         is_rx = str(r.get(expected_rx_col, "")).strip().lower() in ("y","yes","true","1")
@@ -399,10 +400,9 @@ if tgt_file and (gls_df_preview is not None) and (en_col_choice and zh_col_choic
             try:
                 pat = re.compile(expected, flags)
             except re.error:
-                # bad regex -> treated as not adhered
                 rows.append({
                     "zh_tw_term": zh_gloss,
-                    "en_expected": en_gloss,
+                    "en_term": en_gloss,
                     "adhered_in_target": False,
                     "match_count": 0,
                     "matched_variant_examples": "",
@@ -442,15 +442,29 @@ if tgt_file and (gls_df_preview is not None) and (en_col_choice and zh_col_choic
 
         rows.append({
             "zh_tw_term": zh_gloss,
-            "en_expected": en_gloss,
+            "en_term": en_gloss,
             "adhered_in_target": match_count > 0,
             "match_count": match_count,
             "matched_variant_examples": "|".join(sorted(set(matched_variants))) if matched_variants else "",
         })
 
-    report_df = pd.DataFrame(rows, columns=[
-        "zh_tw_term", "en_expected", "adhered_in_target", "match_count", "matched_variant_examples"
-    ])
+    # ========= Direction-specific report schema =========
+    if direction == "EN → ZH-TW":
+        report_df = pd.DataFrame([{
+            "en_term": r["en_term"],
+            "zh_tw_expected": r["zh_tw_term"],
+            "adhered_in_target": r["adhered_in_target"],
+            "match_count": r["match_count"],
+            "matched_variant_examples": r["matched_variant_examples"],
+        } for r in rows], columns=["en_term","zh_tw_expected","adhered_in_target","match_count","matched_variant_examples"])
+    else:
+        report_df = pd.DataFrame([{
+            "zh_tw_term": r["zh_tw_term"],
+            "en_expected": r["en_term"],
+            "adhered_in_target": r["adhered_in_target"],
+            "match_count": r["match_count"],
+            "matched_variant_examples": r["matched_variant_examples"],
+        } for r in rows], columns=["zh_tw_term","en_expected","adhered_in_target","match_count","matched_variant_examples"])
 
     # ========= Simplified audit & Mainland terms on the Chinese corpus =========
     if direction == "EN → ZH-TW":
@@ -519,17 +533,19 @@ if tgt_file and (gls_df_preview is not None) and (en_col_choice and zh_col_choic
         }])
     stats_df = text_stats(tgt_raw, tgt_segments)
 
-    # ========= Export to Excel (first sheet = your 5-column report) =========
+    # ========= Export to Excel (first sheet = report_df) =========
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as xw:
-        report_df.to_excel(xw, index=False, sheet_name="coverage_minimal")
+        # Name the first sheet consistently
+        sheet_name = "coverage_minimal"
+        report_df.to_excel(xw, index=False, sheet_name=sheet_name)
         (simp_summary_df if not simp_summary_df.empty else pd.DataFrame([{"info":"No simplified chars flagged"}])).to_excel(xw, index=False, sheet_name="simplified_summary")
         (simp_occ_df if not simp_occ_df.empty else pd.DataFrame([{"info":"No occurrences"}])).to_excel(xw, index=False, sheet_name="simplified_occurrences")
         ml_df.to_excel(xw, index=False, sheet_name="mainland_vs_tw")
         stats_df.to_excel(xw, index=False, sheet_name="text_stats")
         pd.DataFrame([{
             "direction": direction, "mode": mode, "whole_word_EN": whole_word,
-            "glossary_source": ("uploaded" if gls_file else (glossary_source or "unknown")),
+            "glossary_source": ("uploaded" if st.session_state.get("dummy", False) or ('gls_file' in locals() and gls_file) else (glossary_source or "unknown")),
             "en_col": en_col_choice, "zh_col": zh_col_choice
         }]).to_excel(xw, index=False, sheet_name="run_info")
 
